@@ -27,9 +27,11 @@ class MultiCoinTradingBot:
         api_secret: Optional[str] = None,
         risk_pct: Optional[float] = None,
         leverage: Optional[int] = None,
+        trade_mode: Optional[str] = None,
     ):
         self.active_pairs = config.ACTIVE_PAIRS
         self.timeframe = config.TIMEFRAME
+        self.trade_mode = (trade_mode or getattr(config, "TRADE_MODE", "LONG_ONLY")).upper()
         self.leverage = leverage if leverage is not None else config.LEVERAGE
         self.risk_pct = risk_pct if risk_pct is not None else config.ACCOUNT_RISK_PER_TRADE
         self.max_concurrent = config.MAX_CONCURRENT_POSITIONS
@@ -76,6 +78,7 @@ class MultiCoinTradingBot:
         print(f"Leverage:              {self.leverage}x Isolated")
         print(f"Take Profit / SL:      1:1.5 R:R (3.0x ATR TP) | 2.0x ATR Stop Loss (0.8% - 3.5%)")
         print(f"Macro Gate:            4H Multi-Timeframe Alignment (EMA50 & Supertrend)")
+        print(f"Trade Architecture:    {self.trade_mode}")
         mode_str = "DRY-RUN / PAPER TRADING" if self.dry_run else ("BINANCE TESTNET" if self.testnet else "LIVE REAL MONEY")
         print(f"Execution Mode:        {mode_str}")
         print(f"Starting Balance:      ${self.client.fetch_balance():,.2f} USDT")
@@ -172,53 +175,70 @@ class MultiCoinTradingBot:
             except Exception:
                 continue
 
+            if len(df_1h) < 50:
+                continue
+
+            # Strict completed-candle evaluation: signals must only trigger on CLOSED candles
+            df_1h_closed = df_1h.iloc[:-1]
+            current_market_price = df_1h["close"].iloc[-1]
+
             prev_b = self.prev_signals[name]["bull"]
             prev_s = self.prev_signals[name]["bear"]
 
-            bull_sig = self.bull_engine.analyze(df_1h, prev_confirmed=prev_b)
-            bear_sig = self.bear_engine.analyze(df_1h, prev_confirmed=prev_s)
+            bull_sig = None
+            bear_sig = None
 
-            self.prev_signals[name]["bull"] = bull_sig.confirmed
-            self.prev_signals[name]["bear"] = bear_sig.confirmed
+            if self.trade_mode in ["LONG_ONLY", "DUAL"]:
+                bull_sig = self.bull_engine.analyze(df_1h_closed, prev_confirmed=prev_b)
+                self.prev_signals[name]["bull"] = bull_sig.confirmed
+            else:
+                self.prev_signals[name]["bull"] = False
+
+            if self.trade_mode in ["SHORT_ONLY", "DUAL"]:
+                bear_sig = self.bear_engine.analyze(df_1h_closed, prev_confirmed=prev_s)
+                self.prev_signals[name]["bear"] = bear_sig.confirmed
+            else:
+                self.prev_signals[name]["bear"] = False
 
             action = None
             order_side = None
             chosen_sig = None
 
-            if bull_sig.confirmed and not bear_sig.confirmed and bull_sig.is_fresh_trigger:
+            if bull_sig and bull_sig.confirmed and (bear_sig is None or not bear_sig.confirmed) and bull_sig.is_fresh_trigger:
                 action = "GO_LONG"
                 order_side = "BUY"
                 chosen_sig = bull_sig
-            elif bear_sig and bear_sig.confirmed and not bull_sig.confirmed and bear_sig.is_fresh_trigger:
+            elif bear_sig and bear_sig.confirmed and (bull_sig is None or not bull_sig.confirmed) and bear_sig.is_fresh_trigger:
                 action = "GO_SHORT"
                 order_side = "SELL"
                 chosen_sig = bear_sig
 
             if action is not None:
-                # 4H MTF Confluence Gate
+                # 4H MTF Confluence Gate (evaluated strictly on completed 4H candles)
                 if config.ENABLE_MTF_4H:
                     try:
                         df_4h = self.client.fetch_ohlcv(sym, timeframe=config.MTF_TIMEFRAME, limit=100)
-                        ema50_4h = compute_ema(df_4h["close"], 50).iloc[-1]
-                        st_dir_4h, _ = compute_supertrend(df_4h, 10, 3.0)
+                        df_4h_closed = df_4h.iloc[:-1]
+                        ema50_4h = compute_ema(df_4h_closed["close"], 50).iloc[-1]
+                        st_dir_4h, _ = compute_supertrend(df_4h_closed, 10, 3.0)
                         supertrend_4h = st_dir_4h.iloc[-1]
-                        price_4h = df_4h["close"].iloc[-1]
+                        price_4h = df_4h_closed["close"].iloc[-1]
 
                         if action == "GO_LONG" and (price_4h < ema50_4h or supertrend_4h != 1):
-                            print(f"[-] {name}: 1H Long Signal vetoed by 4H MTF Gate (Price ${price_4h:.2f} < EMA50 ${ema50_4h:.2f} or ST != 1)")
+                            print(f"[-] {name}: 1H Long Signal vetoed by 4H MTF Gate (Completed 4H Price ${price_4h:.2f} < EMA50 ${ema50_4h:.2f} or ST != 1)")
                             continue
                         elif action == "GO_SHORT" and (price_4h > ema50_4h or supertrend_4h != -1):
-                            print(f"[-] {name}: 1H Short Signal vetoed by 4H MTF Gate (Price ${price_4h:.2f} > EMA50 ${ema50_4h:.2f} or ST != -1)")
+                            print(f"[-] {name}: 1H Short Signal vetoed by 4H MTF Gate (Completed 4H Price ${price_4h:.2f} > EMA50 ${ema50_4h:.2f} or ST != -1)")
                             continue
                     except Exception:
                         continue
 
-                # Position Sizing
+                # Position Sizing: Use real-time current market price for actual execution
                 prec = self.client.get_market_precision(sym)
                 pos = self.risk_manager.calculate_position(
                     account_equity=equity,
                     side=order_side,
-                    entry_price=chosen_sig.entry_price,
+                    entry_price=current_market_price,
                     stop_loss=chosen_sig.stop_loss,
                     take_profit=chosen_sig.take_profit,
                     min_qty=prec["min_qty"],
@@ -262,11 +282,13 @@ class MultiCoinTradingBot:
                 print(f"{name:<8} [Data Error: {e}]")
                 continue
 
+            df_1h_closed = df_1h.iloc[:-1]
+            df_4h_closed = df_4h.iloc[:-1]
             curr_price = df_1h["close"].iloc[-1]
-            ema50_4h = compute_ema(df_4h["close"], 50).iloc[-1]
-            st_dir_4h, _ = compute_supertrend(df_4h, 10, 3.0)
+            ema50_4h = compute_ema(df_4h_closed["close"], 50).iloc[-1]
+            st_dir_4h, _ = compute_supertrend(df_4h_closed, 10, 3.0)
             st_4h = st_dir_4h.iloc[-1]
-            p_4h = df_4h["close"].iloc[-1]
+            p_4h = df_4h_closed["close"].iloc[-1]
 
             mtf_status = "NEUTRAL"
             if p_4h > ema50_4h and st_4h == 1:
@@ -274,8 +296,8 @@ class MultiCoinTradingBot:
             elif p_4h < ema50_4h and st_4h == -1:
                 mtf_status = "BEARISH"
 
-            bull_sig = self.bull_engine.analyze(df_1h)
-            bear_sig = self.bear_engine.analyze(df_1h)
+            bull_sig = self.bull_engine.analyze(df_1h_closed)
+            bear_sig = self.bear_engine.analyze(df_1h_closed)
 
             trigger_str = "None"
             action_str = "STAND_BY"

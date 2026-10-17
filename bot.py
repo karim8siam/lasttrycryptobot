@@ -25,9 +25,11 @@ class DualEngineTradingBot:
         api_secret: Optional[str] = None,
         risk_pct: Optional[float] = None,
         leverage: Optional[int] = None,
+        trade_mode: Optional[str] = None,
     ):
         self.symbol = symbol if symbol is not None else config.SYMBOL
         self.timeframe = config.TIMEFRAME
+        self.trade_mode = (trade_mode or getattr(config, "TRADE_MODE", "LONG_ONLY")).upper()
         self.leverage = leverage if leverage is not None else config.LEVERAGE
         self.risk_pct = risk_pct if risk_pct is not None else config.ACCOUNT_RISK_PER_TRADE
 
@@ -92,6 +94,12 @@ class DualEngineTradingBot:
             print(f"Failed to fetch market data: {e}")
             return
 
+        if len(df) < 50:
+            print("Insufficient candle data fetched. Standing down.")
+            return
+
+        # Separate completed candles from active forming candle
+        df_closed = df.iloc[:-1]
         current_price = df['close'].iloc[-1]
         c_high = df['high'].iloc[-1]
         c_low = df['low'].iloc[-1]
@@ -142,15 +150,23 @@ class DualEngineTradingBot:
                 print(f">>> POSITION ACTIVE ({side} @ ${entry:,.4f}). Monitoring exits: SL ${sl:,.4f} | TP ${tp:,.4f}.")
                 return
 
-        # 2. Run Engine 1: Bull Confirmation Engine (Upward)
-        bull_signal = self.bull_engine.analyze(df, prev_confirmed=self.prev_bull_confirmed)
+        # 2. Run Engine 1: Bull Confirmation Engine (Upward) on completed candles
+        if self.trade_mode in ["LONG_ONLY", "DUAL"]:
+            bull_signal = self.bull_engine.analyze(df_closed, prev_confirmed=self.prev_bull_confirmed)
+            self.prev_bull_confirmed = bull_signal.confirmed
+        else:
+            from bull_engine import BullSignal
+            bull_signal = BullSignal(confirmed=False, score=0.0, entry_price=current_price, stop_loss=0.0, take_profit=0.0, risk_reward_ratio=1.5, reasons=["Engine disabled by TRADE_MODE"])
+            self.prev_bull_confirmed = False
 
-        # 3. Run Engine 2: Bear Confirmation Engine (Downward)
-        bear_signal = self.bear_engine.analyze(df, prev_confirmed=self.prev_bear_confirmed)
-
-        # Update historical state for next cycle
-        self.prev_bull_confirmed = bull_signal.confirmed
-        self.prev_bear_confirmed = bear_signal.confirmed
+        # 3. Run Engine 2: Bear Confirmation Engine (Downward) on completed candles
+        if self.trade_mode in ["SHORT_ONLY", "DUAL"]:
+            bear_signal = self.bear_engine.analyze(df_closed, prev_confirmed=self.prev_bear_confirmed)
+            self.prev_bear_confirmed = bear_signal.confirmed
+        else:
+            from bear_engine import BearSignal
+            bear_signal = BearSignal(confirmed=False, score=0.0, entry_price=current_price, stop_loss=0.0, take_profit=0.0, risk_reward_ratio=1.5, reasons=["Engine disabled by TRADE_MODE"])
+            self.prev_bear_confirmed = False
 
         print("-" * 55)
         print(f"ENGINE 1 (UPWARD CONFIRMATION):   Score: {bull_signal.score:5.1f}% | Confirmed: {bull_signal.confirmed} | Fresh: {bull_signal.is_fresh_trigger}")
@@ -195,24 +211,25 @@ class DualEngineTradingBot:
             print(">>> VERDICT: NO EDGE / MARKET IN CHOP. Both engines say NO. Preserving capital.")
             return
 
-        # 4.5. Multi-Timeframe (4H) Trend Confluence Gate
+        # 4.5. Multi-Timeframe (4H) Trend Confluence Gate (evaluated strictly on completed 4H candle)
         if getattr(config, "ENABLE_MTF_4H", False):
             try:
                 df_4h = self.client.fetch_ohlcv(self.symbol, timeframe=config.MTF_TIMEFRAME, limit=100)
-                ema50_4h = compute_ema(df_4h['close'], 50).iloc[-1]
-                st_dir_4h, _ = compute_supertrend(df_4h, 10, 3.0)
+                df_4h_closed = df_4h.iloc[:-1]
+                ema50_4h = compute_ema(df_4h_closed['close'], 50).iloc[-1]
+                st_dir_4h, _ = compute_supertrend(df_4h_closed, 10, 3.0)
                 supertrend_4h = st_dir_4h.iloc[-1]
-                price_4h = df_4h['close'].iloc[-1]
+                price_4h = df_4h_closed['close'].iloc[-1]
 
                 if action == "GO_LONG":
                     if price_4h < ema50_4h or supertrend_4h != 1:
-                        print(f">>> [MTF 4H VETO]: 1H Long Signal REJECTED. 4H Macro Trend is not aligned (Price: ${price_4h:,.2f}, 4H EMA50: ${ema50_4h:,.2f}, 4H Supertrend: {supertrend_4h}).")
+                        print(f">>> [MTF 4H VETO]: 1H Long Signal REJECTED. Completed 4H Macro Trend is not aligned (Price: ${price_4h:,.2f}, 4H EMA50: ${ema50_4h:,.2f}, 4H Supertrend: {supertrend_4h}).")
                         return
                     else:
                         print(f">>> [MTF 4H CONFLUENCE CONFIRMED]: 4H Macro Trend is BULLISH (Price > EMA50 and Supertrend Green).")
                 elif action == "GO_SHORT":
                     if price_4h > ema50_4h or supertrend_4h != -1:
-                        print(f">>> [MTF 4H VETO]: 1H Short Signal REJECTED. 4H Macro Trend is not aligned (Price: ${price_4h:,.2f}, 4H EMA50: ${ema50_4h:,.2f}, 4H Supertrend: {supertrend_4h}).")
+                        print(f">>> [MTF 4H VETO]: 1H Short Signal REJECTED. Completed 4H Macro Trend is not aligned (Price: ${price_4h:,.2f}, 4H EMA50: ${ema50_4h:,.2f}, 4H Supertrend: {supertrend_4h}).")
                         return
                     else:
                         print(f">>> [MTF 4H CONFLUENCE CONFIRMED]: 4H Macro Trend is BEARISH (Price < EMA50 and Supertrend Red).")
@@ -226,7 +243,7 @@ class DualEngineTradingBot:
         position_calc = self.risk_manager.calculate_position(
             account_equity=account_equity,
             side=order_side,
-            entry_price=chosen_signal.entry_price,
+            entry_price=current_price,
             stop_loss=chosen_signal.stop_loss,
             take_profit=chosen_signal.take_profit,
             min_qty=precisions['min_qty'],

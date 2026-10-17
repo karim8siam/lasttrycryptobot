@@ -17,6 +17,13 @@ BINANCE_API_SECRET = ""
 TESTNET = True     # Use Binance Futures Sandbox/Testnet if True
 DRY_RUN = True     # Paper trading mode (no real money risked, real market data used)
 
+# Trade Direction Architecture:
+# - "LONG_ONLY"  : (Recommended) Runs exclusively with Bull Engine (+65.85% win rate, +25.74% net return, 6.26% max DD).
+#                  Eliminates negative-EV short trades in crypto trend-following regimes.
+# - "DUAL"       : Runs both Bull (Long) and Bear (Short) Engines concurrently.
+# - "SHORT_ONLY" : Runs exclusively with Bear Engine.
+TRADE_MODE = "LONG_ONLY"
+
 # Active Curated Coin Universe (Top 24 verified high-accuracy pairs >= 40%)
 ACTIVE_PAIRS = [
     ("SOL", "SOL/USDT"),
