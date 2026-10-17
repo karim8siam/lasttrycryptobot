@@ -196,6 +196,8 @@ def run_historical_audit(candle_limit: int = 1000):
             is_star_arr = is_star_s.values
             bull_eng_arr = bull_engulf.values
             bear_eng_arr = bear_engulf.values
+            sh_fractal_arr = sh_fractal.values
+            sl_fractal_arr = sl_fractal.values
 
             c4_arr = merged_4h["close"].values
             ema50_4h_arr = merged_4h["ema50"].values
@@ -266,7 +268,7 @@ def run_historical_audit(candle_limit: int = 1000):
                     elif mhist_arr[i] > pmhist_arr[i]:
                         score += 5.0
 
-                    sh_ref = sh_fractal[i] if not np.isnan(sh_fractal[i]) else swing_high_15[i]
+                    sh_ref = sh_fractal_arr[i] if not np.isnan(sh_fractal_arr[i]) else swing_high_15[i]
                     crit5 = 0.0
                     if cp >= sh_ref and vol_arr[i] >= 1.1 * vol_ma_arr[i]:
                         crit5 = 15.0
@@ -311,7 +313,7 @@ def run_historical_audit(candle_limit: int = 1000):
                     elif mhist_arr[i] < pmhist_arr[i]:
                         score += 5.0
 
-                    sl_ref = sl_fractal[i] if not np.isnan(sl_fractal[i]) else swing_low_15[i]
+                    sl_ref = sl_fractal_arr[i] if not np.isnan(sl_fractal_arr[i]) else swing_low_15[i]
                     crit5 = 0.0
                     if cp <= sl_ref and vol_arr[i] >= 1.1 * vol_ma_arr[i]:
                         crit5 = 15.0
